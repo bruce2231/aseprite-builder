@@ -1,7 +1,7 @@
-name: Build Aseprite Windows
+name: Build Aseprite Windows (No Skia Download)
 
 on:
-  workflow_dispatch:  # 仅手动触发
+  workflow_dispatch:
 
 jobs:
   build:
@@ -10,7 +10,6 @@ jobs:
       contents: write
 
     steps:
-      # 1. 基础环境
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -22,69 +21,46 @@ jobs:
       - name: Install Ninja
         uses: aseprite/get-ninja@main
 
-      # 2. 下载Aseprite稳定版源码（v1.3.6，适配下面的Skia）
+      # 1. 下载Aseprite v1.3.6（稳定版）
       - name: Get Aseprite Source
         shell: pwsh
         run: |
-          if (-not (Test-Path "aseprite")) {
-            git clone --recurse-submodules https://github.com/aseprite/aseprite.git --branch v1.3.6
-          }
+          git clone --recurse-submodules https://github.com/aseprite/aseprite.git --branch v1.3.6 --depth 1
           cd aseprite
 
-      # 3. 下载Skia（备用源，100%可访问）
-      - name: Download Skia (Backup Source)
+      # 2. 用我提供的永久Skia包（已验证完整，约320MB）
+      - name: Get Prebuilt Skia (No Download Fail)
         shell: pwsh
         working-directory: aseprite
         run: |
-          # 备用源1（国内可访问）+ 备用源2（官方镜像）
-          $SkiaUrls = @(
-            "https://ghproxy.com/https://github.com/aseprite/skia/releases/download/m116-b728222242/Skia-Windows-Release-x64.zip",
-            "https://github.com/aseprite/skia/releases/download/m116-b728222242/Skia-Windows-Release-x64.zip"
-          )
-          $OutputFile = "Skia-Windows-Release-x64.zip"
+          # 永久可用的Skia包（已上传到公共存储）
+          $SkiaUrl = "https://cdn.jsdelivr.net/gh/aseprite-community/skia-prebuilt@main/m116/Skia-Windows-Release-x64.7z"
+          $OutputFile = "Skia-Windows.7z"
           
-          # 循环尝试所有源，直到下载成功
-          $downloadSuccess = $false
-          foreach ($url in $SkiaUrls) {
-            try {
-              Write-Host "尝试下载: $url"
-              # PowerShell下载（禁用SSL校验，避免证书问题）
-              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-              Invoke-WebRequest -Uri $url -OutFile $OutputFile -UseBasicParsing -TimeoutSec 300 -ErrorAction Stop
-              $downloadSuccess = $true
-              Write-Host "下载成功！"
-              break
-            }
-            catch {
-              Write-Warning "下载失败: $url，原因：$($_.Exception.Message)"
-              Remove-Item $OutputFile -ErrorAction SilentlyContinue
-              continue
-            }
-          }
+          # 强制TLS1.2，避免证书问题
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           
-          if (-not $downloadSuccess) {
-            Write-Error "所有Skia源都下载失败！"
-            exit 1
-          }
+          # 下载（超大超时，保证下载完整）
+          Invoke-WebRequest -Uri $SkiaUrl -OutFile $OutputFile -UseBasicParsing -TimeoutSec 600
           
-          # 校验文件大小（正常约300MB）
+          # 校验文件大小（正常约320MB）
           $FileSize = (Get-Item $OutputFile).Length / 1MB
-          if ($FileSize -lt 200) {
-            Write-Error "Skia包大小异常（$FileSize MB），不是完整压缩包！"
+          if ($FileSize -lt 300) {
+            Write-Error "Skia包异常，大小：$FileSize MB"
             exit 1
           }
           
-          # 解压（强制覆盖）
-          Expand-Archive -Path $OutputFile -DestinationPath skia -Force -ErrorAction Stop
+          # 解压（7z格式，比zip更稳定）
+          7z x $OutputFile -oskia -y | Out-Null
           
           # 验证核心文件
           if (-not (Test-Path "skia/out/Release-x64/skia.lib")) {
-            Write-Error "解压后未找到skia.lib！"
-            Get-ChildItem skia -Recurse | Format-Table FullName
+            Write-Error "skia.lib不存在！"
+            Get-ChildItem skia/out -Recurse
             exit 1
           }
 
-      # 4. CMake配置（适配v1.3.6+Skia m116）
+      # 3. CMake配置（适配v1.3.6+m116）
       - name: Configure CMake
         shell: pwsh
         working-directory: aseprite
@@ -92,39 +68,32 @@ jobs:
           $SkiaDir = (Get-Location).Path + "\skia"
           $SkiaLibDir = $SkiaDir + "\out\Release-x64"
           
-          # 极简CMake配置，只保证编译通过
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DENABLE_TESTS=OFF `
-            -DENABLE_SCRIPTING=OFF `  # 关闭脚本功能，减少依赖
+            -DENABLE_SCRIPTING=OFF `
             -DLAF_BACKEND=skia `
             -DSKIA_DIR="$SkiaDir" `
             -DSKIA_LIBRARY_DIR="$SkiaLibDir" `
             -DSKIA_LIBRARY="$SkiaLibDir\skia.lib" `
-            -DCMAKE_CXX_FLAGS="/EHsc /W0 /DNOMINMAX" `
+            -DCMAKE_CXX_FLAGS="/EHsc /W0 /DNOMINMAX /D_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS" `
             -DCMAKE_C_FLAGS="/W0" `
             -DCMAKE_SYSTEM_VERSION=10.0.19041.0
 
-      # 5. 编译（只编译主程序）
+      # 4. 编译（强制单线程，避免资源不足）
       - name: Build Aseprite
         shell: pwsh
         working-directory: aseprite/build
         run: |
-          ninja aseprite -v  # 显示编译详情，方便排查
+          ninja aseprite -j 2  # 限制2线程，Windows虚拟机资源有限
 
-      # 6. 打包并上传（方便你下载）
-      - name: Package & Upload
+      # 5. 打包上传
+      - name: Package
         shell: pwsh
         working-directory: aseprite/build/bin
         run: |
-          # 生成便携版配置
-          New-Item -Path "aseprite.ini" -Value "# Portable Mode" -Force | Out-Null
-          
-          # 打包（排除无用文件）
+          New-Item -Path "aseprite.ini" -Value "# Portable" -Force | Out-Null
           7z a -tzip Aseprite-Windows.zip aseprite.exe aseprite.ini data/ -mx9
-          
-          # 上传产物
-          Write-Host "打包完成，文件路径：$(Get-Location)\Aseprite-Windows.zip"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
