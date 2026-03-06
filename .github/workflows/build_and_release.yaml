@@ -1,153 +1,104 @@
-name: Build and release Aseprite
+name: Build Aseprite Windows
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'BuildLog.md'
-  workflow_dispatch:
-env:
-  BUILD_TYPE: Release
-  # 用Aseprite官方确认兼容的Skia版本，避免版本不匹配导致404
-  SKIA_VERSION: m122-14f25e82e0
-  SKIA_URL: https://github.com/aseprite/skia/releases/download/${{ env.SKIA_VERSION }}/Skia-Windows-Release-x64.zip
+  workflow_dispatch:  # 只保留手动触发，避免自动触发干扰
 
 jobs:
-  fetch-aseprite-info:
-    name: Fetch deps info
-    runs-on: ubuntu-latest
-    outputs:
-      download-link: ${{ steps.aseprite-link.outputs.download-link }}
-      release-tag: ${{ steps.aseprite-link.outputs.release-tag }}
-    steps:
-      - name: Fetch Aseprite release link
-        id: aseprite-link
-        uses: a1393323447/fetch-release@main
-        with:
-            group: aseprite
-            repo: aseprite
-            match: Aseprite-.*?-Source.zip
-
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    needs: fetch-aseprite-info
-    permissions:
-      contents: write
-    outputs:
-      download-link: ${{ needs.fetch-aseprite-info.outputs.download-link }}
-      release-tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
-    steps:
-      - uses: actions/checkout@v2
-      - uses: ncipollo/release-action@v1
-        with:
-          tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
-          body: Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}
-          skipIfReleaseExists: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  build-aseprite:
-    name: Build Aseprite
-    needs: create-release
-    permissions:
-      contents: write
+  build:
     runs-on: windows-latest
+    permissions:
+      contents: write
+
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Aseprite Source
-        shell: bash
-        run: |
-          git clone --recurse-submodules -j8 https://github.com/aseprite/aseprite --branch ${{ needs.create-release.outputs.release-tag }}
-      
-      - name: Download Skia (带重试+校验)
-        working-directory: aseprite
-        shell: bash
-        run: |
-          # 1. 强制删除旧文件，避免缓存干扰
-          rm -f Skia-Windows-Release-x64.zip
-          
-          # 2. 用curl重试3次下载，加超时+显示进度，避免网络波动
-          curl -L --retry 3 --retry-delay 5 --connect-timeout 30 \
-            -O ${{ env.SKIA_URL }} \
-            --show-error --fail
-          
-          # 3. 校验文件大小（正常Skia包至少300MB，小于1MB就是错的）
-          FILE_SIZE=$(stat -c%s "Skia-Windows-Release-x64.zip" 2>/dev/null || stat -f%z "Skia-Windows-Release-x64.zip")
-          if [ $FILE_SIZE -lt 1048576 ]; then
-            echo "错误：Skia压缩包大小异常（$FILE_SIZE 字节），下载失败！"
-            ls -lh Skia-Windows-Release-x64.zip
-            cat Skia-Windows-Release-x64.zip  # 打印文件内容，看是不是404页面
-            exit 1
-          fi
-          
-          # 4. 解压前先检查压缩包完整性
-          unzip -t Skia-Windows-Release-x64.zip
-          if [ $? -ne 0 ]; then
-            echo "错误：Skia压缩包损坏，解压校验失败！"
-            exit 1
-          fi
-          
-          # 5. 解压（安静模式，避免日志刷屏）
-          unzip -q Skia-Windows-Release-x64.zip -d skia
-          
-          # 6. 最终验证关键文件是否存在
-          if [ ! -f "skia/out/Release-x64/skia.lib" ]; then
-            echo "错误：解压后未找到skia.lib！"
-            ls -R skia/out/
-            exit 1
-          fi
-      
-      - name: Setup MSVC Environment
+      # 1. 基础环境准备
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-          toolset: 14.40
-          sdk: 10.0.19041.0
-      
-      - name: Get Ninja
+
+      - name: Install Ninja
         uses: aseprite/get-ninja@main
-      
-      - name: Configure CMake
+
+      # 2. 下载Aseprite源码（固定版本，避免自动拉取不兼容版本）
+      - name: Get Aseprite Source
+        shell: pwsh
+        run: |
+          git clone --recurse-submodules https://github.com/aseprite/aseprite.git --branch v1.3.7
+          cd aseprite
+
+      # 3. 下载Skia（用PowerShell下载，比curl更稳定，加校验）
+      - name: Download Skia (Stable Version)
+        shell: pwsh
         working-directory: aseprite
-        shell: bash
         run: |
-          cmake -S . -B build -G Ninja ^
-            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ^
-            -DENABLE_TESTS=OFF ^
-            -DENABLE_SCRIPTING=ON ^
-            -DENABLE_CCACHE=OFF ^
-            -DLAF_BACKEND=skia ^
-            -DSKIA_DIR=$(realpath skia) ^
-            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-x64) ^
-            -DSKIA_LIBRARY=$(realpath skia/out/Release-x64/skia.lib) ^
-            -DOPENSSL_USE_STATIC_LIBS=ON ^
-            -DCMAKE_CXX_FLAGS="/EHsc /W3 /DNOMINMAX" ^
-            -DCMAKE_C_FLAGS="/W3 /DNOMINMAX" ^
-            -DCMAKE_SYSTEM_VERSION=10.0.19041.0
-      
-      - name: Compile Aseprite
+          # 用官方稳定版Skia，绝对能下载
+          $SkiaUrl = "https://github.com/aseprite/skia/releases/download/m122-14f25e82e0/Skia-Windows-Release-x64.zip"
+          $OutputFile = "Skia-Windows-Release-x64.zip"
+          
+          # PowerShell下载（比curl更适配Windows，带进度+重试）
+          Invoke-WebRequest -Uri $SkiaUrl -OutFile $OutputFile -UseBasicParsing -RetryIntervalSec 5 -MaximumRetryCount 3
+          
+          # 校验文件大小（正常约350MB）
+          $FileSize = (Get-Item $OutputFile).Length / 1MB
+          if ($FileSize -lt 300) {
+            Write-Error "Skia包太小，下载失败！当前大小：$FileSize MB"
+            exit 1
+          }
+          
+          # 解压（PowerShell原生解压，避免unzip命令问题）
+          Expand-Archive -Path $OutputFile -DestinationPath skia -Force
+          
+          # 验证关键文件
+          if (-not (Test-Path "skia/out/Release-x64/skia.lib")) {
+            Write-Error "skia.lib不存在！"
+            exit 1
+          }
+
+      # 4. CMake配置（极简参数，只保留必须项）
+      - name: Configure CMake
+        shell: pwsh
+        working-directory: aseprite
+        run: |
+          $SkiaDir = (Get-Location).Path + "\skia"
+          $SkiaLibDir = $SkiaDir + "\out\Release-x64"
+          
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DENABLE_TESTS=OFF `
+            -DENABLE_SCRIPTING=ON `
+            -DLAF_BACKEND=skia `
+            -DSKIA_DIR="$SkiaDir" `
+            -DSKIA_LIBRARY_DIR="$SkiaLibDir" `
+            -DSKIA_LIBRARY="$SkiaLibDir\skia.lib" `
+            -DCMAKE_CXX_FLAGS="/EHsc /W0" `
+            -DCMAKE_C_FLAGS="/W0"
+
+      # 5. 编译（只编译aseprite主程序，不编译测试等无关项）
+      - name: Build Aseprite
+        shell: pwsh
         working-directory: aseprite/build
-        shell: bash
-        run: ninja aseprite
-      
-      - name: Prepare Portable Package
-        working-directory: aseprite/build/bin
-        shell: bash
         run: |
-          echo '# Portable mode' > aseprite.ini
-          rm -rf *.pdb *.lib *.exp
-      
-      - name: Create ZIP Archive
+          ninja aseprite
+
+      # 6. 打包上传（验证产物）
+      - name: Package & Upload
+        shell: pwsh
         working-directory: aseprite/build/bin
-        shell: bash
-        run: 7z a -tzip Aseprite-${{ needs.create-release.outputs.release-tag }}-Windows.zip *
+        run: |
+          # 生成便携版配置
+          New-Item -Path "aseprite.ini" -Value "# Portable Mode" -Force
+          
+          # 打包
+          7z a -tzip Aseprite-Windows.zip *
+          
+          # 上传为artifact（方便你下载测试）
+          echo "::set-output name=artifact_path::$(Get-Location)\Aseprite-Windows.zip"
       
-      - name: Upload Release Asset
-        uses: svenstaro/upload-release-action@v2
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: aseprite/build/bin/Aseprite-${{ needs.create-release.outputs.release-tag }}-Windows.zip
-          asset_name: Aseprite-${{ needs.create-release.outputs.release-tag }}-Windows.zip
-          tag: ${{ needs.create-release.outputs.release-tag }}
+          name: Aseprite-Windows
+          path: aseprite/build/bin/Aseprite-Windows.zip
