@@ -9,7 +9,9 @@ on:
   workflow_dispatch:
 env:
   BUILD_TYPE: Release
-  SKIA_VERSION: m122-14f25e82e0  # 匹配Aseprite的稳定Skia版本
+  # 用Aseprite官方确认兼容的Skia版本，避免版本不匹配导致404
+  SKIA_VERSION: m122-14f25e82e0
+  SKIA_URL: https://github.com/aseprite/skia/releases/download/${{ env.SKIA_VERSION }}/Skia-Windows-Release-x64.zip
 
 jobs:
   fetch-aseprite-info:
@@ -59,15 +61,41 @@ jobs:
         run: |
           git clone --recurse-submodules -j8 https://github.com/aseprite/aseprite --branch ${{ needs.create-release.outputs.release-tag }}
       
-      - name: Download Skia (Windows x64)
+      - name: Download Skia (带重试+校验)
         working-directory: aseprite
         shell: bash
         run: |
-          curl -L -O https://github.com/aseprite/skia/releases/download/${{ env.SKIA_VERSION }}/Skia-Windows-Release-x64.zip
+          # 1. 强制删除旧文件，避免缓存干扰
+          rm -f Skia-Windows-Release-x64.zip
+          
+          # 2. 用curl重试3次下载，加超时+显示进度，避免网络波动
+          curl -L --retry 3 --retry-delay 5 --connect-timeout 30 \
+            -O ${{ env.SKIA_URL }} \
+            --show-error --fail
+          
+          # 3. 校验文件大小（正常Skia包至少300MB，小于1MB就是错的）
+          FILE_SIZE=$(stat -c%s "Skia-Windows-Release-x64.zip" 2>/dev/null || stat -f%z "Skia-Windows-Release-x64.zip")
+          if [ $FILE_SIZE -lt 1048576 ]; then
+            echo "错误：Skia压缩包大小异常（$FILE_SIZE 字节），下载失败！"
+            ls -lh Skia-Windows-Release-x64.zip
+            cat Skia-Windows-Release-x64.zip  # 打印文件内容，看是不是404页面
+            exit 1
+          fi
+          
+          # 4. 解压前先检查压缩包完整性
+          unzip -t Skia-Windows-Release-x64.zip
+          if [ $? -ne 0 ]; then
+            echo "错误：Skia压缩包损坏，解压校验失败！"
+            exit 1
+          fi
+          
+          # 5. 解压（安静模式，避免日志刷屏）
           unzip -q Skia-Windows-Release-x64.zip -d skia
-          # 验证Skia文件是否存在
+          
+          # 6. 最终验证关键文件是否存在
           if [ ! -f "skia/out/Release-x64/skia.lib" ]; then
-            echo "Error: skia.lib not found!"
+            echo "错误：解压后未找到skia.lib！"
+            ls -R skia/out/
             exit 1
           fi
       
@@ -109,7 +137,6 @@ jobs:
         shell: bash
         run: |
           echo '# Portable mode' > aseprite.ini
-          # 清理无关文件
           rm -rf *.pdb *.lib *.exp
       
       - name: Create ZIP Archive
