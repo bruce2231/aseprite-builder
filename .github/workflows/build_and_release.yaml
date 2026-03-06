@@ -9,6 +9,7 @@ on:
   workflow_dispatch:
 env:
   BUILD_TYPE: Release
+  SKIA_VERSION: m122-14f25e82e0  # 匹配Aseprite的稳定Skia版本
 
 jobs:
   fetch-aseprite-info:
@@ -49,89 +50,77 @@ jobs:
     needs: create-release
     permissions:
       contents: write
-    runs-on: ${{ matrix.os }}
-    strategy:
-        matrix:
-          os: [ windows-latest]
-        fail-fast: false
+    runs-on: windows-latest
     steps:
-      - name: Install Dependencies
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
-            libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
-            libfontconfig1-dev
       - uses: actions/checkout@v4
-      - name: Install Aseprite
+      
+      - name: Install Aseprite Source
         shell: bash
         run: |
           git clone --recurse-submodules -j8 https://github.com/aseprite/aseprite --branch ${{ needs.create-release.outputs.release-tag }}
-      - name: Install Skia
+      
+      - name: Download Skia (Windows x64)
         working-directory: aseprite
         shell: bash
         run: |
-          if [[ "${{ runner.os }}" == "Windows" ]] ; then
-            # 关键修改1：删掉choco install wget，改用curl
-            curl -L -O https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip
-            unzip Skia-Windows-Release-x64.zip -d skia
-          elif [[ "${{ runner.os }}" == "macOS" ]] ; then
-            # 关键修改2：macOS也改用curl（避免后续同理问题）
-            curl -L -O https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-macOS-Release-arm64.zip
-            unzip Skia-macOS-Release-arm64.zip -d skia
-          else
-            # 关键修改3：Linux也改用curl（统一标准）
-            curl -L -O https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Linux-Release-x64.zip
-            unzip Skia-Linux-Release-x64.zip -d skia
+          curl -L -O https://github.com/aseprite/skia/releases/download/${{ env.SKIA_VERSION }}/Skia-Windows-Release-x64.zip
+          unzip -q Skia-Windows-Release-x64.zip -d skia
+          # 验证Skia文件是否存在
+          if [ ! -f "skia/out/Release-x64/skia.lib" ]; then
+            echo "Error: skia.lib not found!"
+            exit 1
           fi
-      - uses: aseprite/get-ninja@main
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: runner.os == 'Windows'
-      - name: Generating Makefiles
-        shell: bash
+      
+      - name: Setup MSVC Environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: 14.40
+          sdk: 10.0.19041.0
+      
+      - name: Get Ninja
+        uses: aseprite/get-ninja@main
+      
+      - name: Configure CMake
         working-directory: aseprite
-        run: |
-          export enable_ccache=off
-          export laf_backend=skia
-          export enable_scripting=on
-
-          if [[ "${{ runner.os }}" == "macOS" ]] ; then
-            export skia_arch=arm64
-          else
-            export skia_arch=x64
-          fi
-
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \  # 修复：matrix.build_type 改成 env.BUILD_TYPE
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.9 \
-            -DENABLE_TESTS=OFF \
-            -DENABLE_SCRIPTING=$enable_scripting \
-            -DENABLE_CCACHE=$enable_ccache \
-            -DLAF_BACKEND=$laf_backend \
-            -DSKIA_DIR=$(realpath skia) \
-            -DOPENSSL_USE_STATIC_LIBS=ON \
-            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch)
-      - name: Compiling
         shell: bash
-        working-directory: aseprite
         run: |
-          cd build && ninja
-      - name: Clean Up Build folder
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ^
+            -DENABLE_TESTS=OFF ^
+            -DENABLE_SCRIPTING=ON ^
+            -DENABLE_CCACHE=OFF ^
+            -DLAF_BACKEND=skia ^
+            -DSKIA_DIR=$(realpath skia) ^
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-x64) ^
+            -DSKIA_LIBRARY=$(realpath skia/out/Release-x64/skia.lib) ^
+            -DOPENSSL_USE_STATIC_LIBS=ON ^
+            -DCMAKE_CXX_FLAGS="/EHsc /W3 /DNOMINMAX" ^
+            -DCMAKE_C_FLAGS="/W3 /DNOMINMAX" ^
+            -DCMAKE_SYSTEM_VERSION=10.0.19041.0
+      
+      - name: Compile Aseprite
+        working-directory: aseprite/build
+        shell: bash
+        run: ninja aseprite
+      
+      - name: Prepare Portable Package
         working-directory: aseprite/build/bin
         shell: bash
-        run: find . -mindepth 1 ! \( -name 'aseprite' -o -name 'aseprite.exe' -o -name 'data' -prune -o -name 'Aseprite.app' -prune \) -exec rm -rf {} +
-      - name: Make portable zip
+        run: |
+          echo '# Portable mode' > aseprite.ini
+          # 清理无关文件
+          rm -rf *.pdb *.lib *.exp
+      
+      - name: Create ZIP Archive
         working-directory: aseprite/build/bin
-        run: echo '# This file is here so Aseprite behaves as a portable program' > aseprite.ini
-      - name: Create release
-        working-directory: aseprite/build/bin
-        run: 7z -tzip a Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip *
-      - name: Upload release
+        shell: bash
+        run: 7z a -tzip Aseprite-${{ needs.create-release.outputs.release-tag }}-Windows.zip *
+      
+      - name: Upload Release Asset
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: aseprite/build/bin/Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip
-          asset_name: Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip
+          file: aseprite/build/bin/Aseprite-${{ needs.create-release.outputs.release-tag }}-Windows.zip
+          asset_name: Aseprite-${{ needs.create-release.outputs.release-tag }}-Windows.zip
           tag: ${{ needs.create-release.outputs.release-tag }}
